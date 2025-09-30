@@ -184,17 +184,31 @@ class SubfinderCommand(Command):
         root_domain = ".".join([ext.domain, ext.suffix])
 
         if ext.subdomain:
-            # Subdomain verilmiş → sadece dosyaya yaz
             with open("subdomains.txt", "w") as f:
                 f.write(self.domain + "\n")
             self.result_file = "subdomains.txt"
-            return "subdomains.txt", self.domain
+            return "subdomains.txt", ""   # sadece dosya, ekrana data verme
         else:
-            # Root domain verilmiş → subfinder çalıştır
-            return self._run(
+            # Subfinder çalıştır
+            self._run(
                 f"subfinder -d {root_domain} -silent",
                 "subdomains.txt"
             )
+
+            # Dosyadan oku ve stage altında bas
+            found = []
+            if os.path.exists("subdomains.txt"):
+                with open("subdomains.txt") as f:
+                    found = [line.strip() for line in f if line.strip()]
+
+            if found:
+                Logger.success(f"[+] {len(found)} subdomains discovered")
+                Logger.list("[+] Subdomains", found[:30], color=Fore.CYAN)
+                if len(found) > 30:
+                    Logger.warning(f"... and {len(found)-30} more (truncated)")
+
+            self.result_file = "subdomains.txt"
+            return "subdomains.txt", ""   # 🔑 output boş
 
 
 class HttpxCommand(Command):
@@ -216,7 +230,7 @@ class HttpxCommand(Command):
             with open(output_file, "w") as outfile:
                 subprocess.run(cmd, stdout=outfile, stderr=subprocess.DEVNULL, text=True)
         else:
-            # Root domain → all subdomains
+            
             with open("subdomains.txt", "r") as infile, open(output_file, "w") as outfile:
                 subprocess.run(
                     ["/root/go/bin/httpx", "-nc", "-status-code", "-title",
@@ -227,7 +241,7 @@ class HttpxCommand(Command):
                     text=True
                 )
 
-        # JSON'u oku → human-readable format bas
+        
         count = 0
         output_text = ""
         if os.path.exists(output_file):
@@ -1202,10 +1216,8 @@ class DomainStrategy(ABC):
 
 class RootDomainStrategy(DomainStrategy):
     def get_targets(self, domain: str) -> list[str]:
-        subfinder = SubfinderCommand(domain)
-        subfinder.execute()
-        with open("subdomains.txt") as f:
-            return [line.strip() for line in f if line.strip()]
+        # Subfinder çalışsın ama sadece root geri dönsün
+        return [domain]
 
 class SubdomainStrategy(DomainStrategy):
     def get_targets(self, domain: str) -> list[str]:
@@ -1314,7 +1326,26 @@ class PipelineInvoker:
             self.first_handler.handle(domain, builder, observers)
 
 
-def build_chain(domain):
+# ---------------------------
+# Chain builder
+# ---------------------------
+def build_chain(domain: str, is_root: bool = False):
+    """
+    Eğer is_root True ise sadece pasif / enum aşamaları.
+    Aksi halde full pipeline çalışır.
+    """
+    # Root → sadece pasif aşamalar
+    if is_root:
+        return CommandHandler(TimingDecorator(SubfinderCommand(domain)),
+            CommandHandler(TimingDecorator(HttpxCommand(domain)),
+            CommandHandler(TimingDecorator(SubzyCommand(domain)),
+            CommandHandler(TimingDecorator(KatanaCommand(domain)),
+            CommandHandler(TimingDecorator(WaybackCommand(domain)),
+            CommandHandler(TimingDecorator(JsHunterCommand(domain)),
+            CommandHandler(TimingDecorator(BackupFinderCommand(domain)),
+            CommandHandler(TimingDecorator(JwtScanCommand(domain))))))))))
+
+    # Subdomain → full pipeline
     return CommandHandler(TimingDecorator(HttpxCommand(domain)),
         CommandHandler(TimingDecorator(SubzyCommand(domain)),
         CommandHandler(TimingDecorator(FfufCommand(domain)),
@@ -1322,7 +1353,7 @@ def build_chain(domain):
         CommandHandler(TimingDecorator(WhatwebCommand(domain)),
         CommandHandler(TimingDecorator(WappalyzerCommand(domain)),
         CommandHandler(TimingDecorator(WaybackCommand(domain)),
-        CommandHandler(TimingDecorator(JsHunterCommand(domain)), 
+        CommandHandler(TimingDecorator(JsHunterCommand(domain)),
         CommandHandler(TimingDecorator(BackupFinderCommand(domain)),
         CommandHandler(TimingDecorator(JwtScanCommand(domain)),
         CommandHandler(TimingDecorator(AiAnalyzeJwtCommand(domain)),
@@ -1331,6 +1362,7 @@ def build_chain(domain):
         CommandHandler(TimingDecorator(NucleiAiCommand(domain)),
         CommandHandler(TimingDecorator(AiSelectEndpointsCommand(domain)),
         CommandHandler(TimingDecorator(NucleiCriticalCommand(domain))))))))))))))))))
+
 
 
 # ---------------------------
@@ -1623,8 +1655,10 @@ class ScannerPipeline:
         self.strategy = SubdomainStrategy() if ext.subdomain else RootDomainStrategy()
 
     def run_single_pipeline(self, domain, builder: "ReportBuilder"):
-        chain = build_chain(domain)              
-        invoker = PipelineInvoker(chain)         
+        ext = tldextract.extract(domain)
+        is_root = not bool(ext.subdomain)
+        chain = build_chain(domain, is_root=is_root)
+        invoker = PipelineInvoker(chain)
         invoker.run(domain, builder, self.observers)
 
     def run(self):
@@ -1634,7 +1668,6 @@ class ScannerPipeline:
             self.run_single_pipeline(target, builder)
 
         all_techs = TechnologyAggregator.collect()
-
         report_file = builder.build_html()
 
         def cleanup_after_report(report_file: str):
@@ -1647,9 +1680,6 @@ class ScannerPipeline:
                         os.remove(f)
                     except Exception as e:
                         pass
-
-        cleanup_after_report(report_file)
-
 
         cleanup_after_report(report_file)
 
