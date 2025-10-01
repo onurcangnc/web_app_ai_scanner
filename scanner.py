@@ -22,10 +22,18 @@ def global_cleanup(report_file=None):
     for f in os.listdir("."):
         if keep and f == keep:
             continue
-        if f.endswith((".json", ".txt", ".log")):
+        # README.md, scanner.py gibi kaynak dosyaları dokunma
+        if f in ("scanner.py", "scanner2.py", "README.md", "resume.cfg"):
+            continue
+
+        # dosya adı içinde .json / .txt / .log geçen her şeyi sil
+        name_lower = f.lower()
+        if any(ext in name_lower for ext in (".json", ".txt", ".log")):
             try:
-                os.remove(f)
-            except Exception as e:
+                path = os.path.join(".", f)
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception:
                 pass
 
 def cleanup_before_run():
@@ -187,15 +195,15 @@ class SubfinderCommand(Command):
             with open("subdomains.txt", "w") as f:
                 f.write(self.domain + "\n")
             self.result_file = "subdomains.txt"
-            return "subdomains.txt", ""   # sadece dosya, ekrana data verme
+            return "subdomains.txt", ""   
         else:
-            # Subfinder çalıştır
+            
             self._run(
                 f"subfinder -d {root_domain} -silent",
                 "subdomains.txt"
             )
 
-            # Dosyadan oku ve stage altında bas
+            
             found = []
             if os.path.exists("subdomains.txt"):
                 with open("subdomains.txt") as f:
@@ -221,7 +229,7 @@ class HttpxCommand(Command):
         output_file = "alive.json"
 
         if ext.subdomain:
-            # Subdomain → single target
+        
             cmd = [
                 "/root/go/bin/httpx", "-u", f"https://{self.domain}",
                 "-nc", "-status-code", "-title", "-tech-detect",
@@ -385,6 +393,88 @@ class FfufCommand(Command):
 
         self.result_file = "ffuf.txt"
         return "ffuf.txt", "\n".join(endpoints)
+    
+# ---------------------------
+# FfufRootCommand - only fuzz the root domain (no subdomains.txt)
+# ---------------------------
+class FfufRootCommand(Command):
+    def get_stage_name(self) -> str:
+        return "FFUF (root) - Endpoint Discovery (root only)"
+
+    def execute(self):
+        # extract root domain (no subdomain)
+        ext = tldextract.extract(self.domain)
+        root = ".".join([ext.domain, ext.suffix])
+
+        baseline_json = "/tmp/baseline.json"
+        baseline_wordlist = "/usr/share/wordlists/onelistforallmicro.txt"
+        out_json = "ffuf.json"
+        out_txt = "ffuf.txt"
+
+        # Baseline quick run to estimate filters (maxtime-job small)
+        subprocess.run(
+            f"ffuf -u https://{root}/FUZZ -w {baseline_wordlist} -mc all -of json -o {baseline_json} -maxtime-job 5",
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        fw_vals, fs_vals = [], []
+        try:
+            with open(baseline_json) as f:
+                data = json.load(f)
+                for r in data.get("results", []):
+                    if "words" in r:
+                        fw_vals.append(r["words"])
+                    if "length" in r:
+                        fs_vals.append(r["length"])
+        except Exception:
+            pass
+
+        from collections import Counter
+        fw_base, fw_count = (0, 0)
+        fs_base, fs_count = (0, 0)
+        if fw_vals:
+            fw_base, fw_count = Counter(fw_vals).most_common(1)[0]
+        if fs_vals:
+            fs_base, fs_count = Counter(fs_vals).most_common(1)[0]
+
+        params = []
+        if fw_vals and fs_vals and fw_count >= len(fw_vals) * 0.6 and fs_count >= len(fs_vals) * 0.6:
+            params = [f"-fw {fw_base}", f"-fs {fs_base}"]
+        elif fw_count >= fs_count and fw_count > 0:
+            params = [f"-fw {fw_base}"]
+        elif fs_count > 0:
+            params = [f"-fs {fs_base}"]
+
+        param_str = " ".join(params)
+        Logger.warning(f"[*] FFUF(root) baseline → fw={fw_base}, fs={fs_base}")
+        Logger.warning(f"[*] Applied filter params: {param_str or 'none'}")
+
+        # Main ffuf on root
+        subprocess.run(
+            f"ffuf -u https://{root}/FUZZ -w {baseline_wordlist} -mc 200,201,202,203,204 {param_str} -of json -o {out_json}",
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        endpoints = []
+        try:
+            with open(out_json) as f:
+                data = json.load(f)
+                for r in data.get("results", []):
+                    url = r.get("url")
+                    if url:
+                        endpoints.append(url)
+        except Exception:
+            pass
+
+        with open(out_txt, "w") as f:
+            f.write("\n".join(endpoints))
+
+        Logger.success(f"[+] FFUF(root) finished → {len(endpoints)} endpoints")
+        Logger.list("[+] FFUF(root) Endpoints (sample)", endpoints[:30], color=Fore.MAGENTA)
+
+        self.result_file = out_txt
+        return out_txt, "\n".join(endpoints)
+
     
 class KatanaCommand(Command):
 
@@ -965,10 +1055,15 @@ class AiSelectEndpointsCommand(Command):
         return "AI Select Endpoints - Suspicious Path Detection"
 
     def execute(self):
-        OPENAI_KEY = "" 
+        OPENAI_KEY = os.getenv("OPENAI_KEY", "") 
+
         client = OpenAI(api_key=OPENAI_KEY)
 
-        ffuf_out = open("ffuf.txt").read().splitlines() if os.path.exists("ffuf.txt") else []
+        # ffuf sonuçlarını oku (hem root hem subdomain)
+        ffuf_out = []
+        if os.path.exists("ffuf.txt"):
+            ffuf_out += open("ffuf.txt").read().splitlines()
+
         katana_out = open("katana.txt").read().splitlines() if os.path.exists("katana.txt") else []
 
         prompt = f"""
@@ -1001,6 +1096,7 @@ Endpoints: {ffuf_out[:300] + katana_out[:100]}
 
         self.result_file = "ai_endpoints.txt"
         return "ai_endpoints.txt", "\n".join(endpoints)
+
 
 def summarize_findings(findings):
     grouped = defaultdict(list)
@@ -1334,16 +1430,18 @@ def build_chain(domain: str, is_root: bool = False):
     Eğer is_root True ise sadece pasif / enum aşamaları.
     Aksi halde full pipeline çalışır.
     """
-    # Root → sadece pasif aşamalar
+    # Root → Only passive phases
     if is_root:
         return CommandHandler(TimingDecorator(SubfinderCommand(domain)),
             CommandHandler(TimingDecorator(HttpxCommand(domain)),
             CommandHandler(TimingDecorator(SubzyCommand(domain)),
+            CommandHandler(TimingDecorator(FfufRootCommand(domain)),
+            CommandHandler(TimingDecorator(AiSelectEndpointsCommand(domain)),
             CommandHandler(TimingDecorator(KatanaCommand(domain)),
             CommandHandler(TimingDecorator(WaybackCommand(domain)),
             CommandHandler(TimingDecorator(JsHunterCommand(domain)),
             CommandHandler(TimingDecorator(BackupFinderCommand(domain)),
-            CommandHandler(TimingDecorator(JwtScanCommand(domain))))))))))
+            CommandHandler(TimingDecorator(JwtScanCommand(domain))))))))))))
 
     # Subdomain → full pipeline
     return CommandHandler(TimingDecorator(HttpxCommand(domain)),
@@ -1365,9 +1463,6 @@ def build_chain(domain: str, is_root: bool = False):
 
 
 
-# ---------------------------
-# Builder Pattern: Report
-# ---------------------------
 # ---------------------------
 # Builder Pattern: Report
 # ---------------------------
@@ -1401,6 +1496,7 @@ class ReportBuilder:
 
     def build_html(self):
         findings = []
+        # JSON findings (nuclei, etc.)
         for title, filename, content in self.sections:
             if filename and filename.endswith(".json"):
                 for line in content.splitlines():
@@ -1435,21 +1531,13 @@ class ReportBuilder:
             "info": "badge-info"
         }
 
-        techs = []
-        try:
-            for t in self.sections:
-                if t[1] and t[1].endswith("tech_ai.json"):
-                    techs = json.loads(t[2]).get("technologies", [])
-        except Exception:
-            pass
-
         html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Security Report - {self.domain}</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-<style>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <title>Security Report - {self.domain}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
     body {{ background:#f8f9fa; }}
     header {{ background:#212529; color:#fff; padding:20px; text-align:center; }}
     .badge-critical {{ background-color:#dc3545; }}
@@ -1457,191 +1545,215 @@ class ReportBuilder:
     .badge-medium {{ background-color:#ffc107; color:#000; }}
     .badge-low {{ background-color:#198754; }}
     .badge-info {{ background-color:#0dcaf0; color:#000; }}
-</style>
-</head>
-<body>
-<header>
-<h1>Security Assessment Report</h1>
-<p>Target: <strong>{self.domain}</strong></p>
-</header>
-<div class="container my-4">
-"""
+    </style>
+    </head>
+    <body>
+    <header>
+    <h1>Security Assessment Report</h1>
+    <p>Target: <strong>{self.domain}</strong></p>
+    </header>
+    <div class="container my-4">
+    """
 
+        # Executive Summary
         total = sum(severity_count.values())
         html += f"""
-<section class="mb-4">
-<h2>Executive Summary</h2>
-<p><strong>Total Findings:</strong> {total}</p>
-<ul>
-    <li>Critical: {severity_count['critical']}</li>
-    <li>High: {severity_count['high']}</li>
-    <li>Medium: {severity_count['medium']}</li>
-    <li>Low: {severity_count['low']}</li>
-    <li>Info: {severity_count['info']}</li>
-</ul>
-</section>
-"""
+    <section class="mb-4">
+    <h2>Executive Summary</h2>
+    <p><strong>Total Findings:</strong> {total}</p>
+    <ul>
+        <li>Critical: {severity_count['critical']}</li>
+        <li>High: {severity_count['high']}</li>
+        <li>Medium: {severity_count['medium']}</li>
+        <li>Low: {severity_count['low']}</li>
+        <li>Info: {severity_count['info']}</li>
+    </ul>
+    </section>
+    """
 
         # 🌍 Alive Hosts
-        try:
-            for t in self.sections:
-                if t[1] and t[1].endswith("alive.json"):
-                    alive = []
-                    for line in t[2].splitlines():
-                        try:
-                            d = json.loads(line)
-                            alive.append((d.get("url"), d.get("title", ""), d.get("status_code", "")))
-                        except Exception:
-                            continue
-                    if alive:
-                        html += """
-<section class="mb-4">
-<h2>🌍 Alive Hosts (HTTPX)</h2>
-<table class="table table-bordered">
-<thead><tr><th>URL</th><th>Status</th><th>Title</th></tr></thead><tbody>
-"""
-                        for url, title, status in alive:
-                            html += f"<tr><td>{url}</td><td>{status}</td><td>{title}</td></tr>"
-                        html += "</tbody></table></section>"
-        except Exception:
-            pass
+        for t in self.sections:
+            if t[1] and t[1].endswith("alive.json"):
+                alive = []
+                for line in t[2].splitlines():
+                    try:
+                        d = json.loads(line)
+                        alive.append((d.get("url"), d.get("status_code", ""), d.get("title", "")))
+                    except Exception:
+                        continue
+                if alive:
+                    html += """
+    <section class="mb-4">
+    <h2>🌍 Alive Hosts (HTTPX)</h2>
+    <table class="table table-bordered">
+    <thead><tr><th>URL</th><th>Status</th><th>Title</th></tr></thead><tbody>
+    """
+                    for url, status, title in alive:
+                        html += f"<tr><td>{url}</td><td>{status}</td><td>{title}</td></tr>"
+                    html += "</tbody></table></section>"
 
         # 📂 FFUF Endpoints
-        try:
-            for t in self.sections:
-                if t[1] and t[1].endswith("ffuf.txt"):
-                    eps = t[2].splitlines()
-                    if eps:
-                        html += """
-<section class="mb-4">
-<h2>📂 FFUF Endpoints</h2>
-<ul>
-"""
-                        for ep in eps:
-                            html += f"<li>{ep}</li>"
-                        html += "</ul></section>"
-        except Exception:
-            pass
-
-        if techs:
-            html += """
-<section class="mb-4">
-<h2>Detected Technologies (AI)</h2>
-<ul>
-"""
-            for t in techs:
-                html += f"<li>{t}</li>"
-            html += "</ul></section>"""
+        for t in self.sections:
+            if t[1] and t[1].endswith("ffuf.txt"):
+                eps = [line for line in t[2].splitlines() if line.strip()]
+                if eps:
+                    html += """
+    <section class="mb-4">
+    <h2>📂 FFUF Endpoints</h2><ul>
+    """
+                    for ep in eps:
+                        html += f"<li>{ep}</li>"
+                    html += "</ul></section>"
 
         # 🚪 AI Endpoints
-        try:
-            for t in self.sections:
-                if t[1] and t[1].endswith("ai_endpoints.txt"):
-                    eps = t[2].splitlines()
-                    if eps:
-                        html += """
-<section class="mb-4">
-<h2>🚪 Suspicious Endpoints (AI)</h2>
-<ul>
-"""
-                        for ep in eps:
-                            html += f"<li>{ep}</li>"
-                        html += "</ul></section>"
-        except Exception:
-            pass
+        for t in self.sections:
+            if t[1] and t[1].endswith("ai_endpoints.txt"):
+                eps = [line for line in t[2].splitlines() if line.strip()]
+                if eps:
+                    html += """
+    <section class="mb-4">
+    <h2>🚪 Suspicious Endpoints (AI)</h2><ul>
+    """
+                    for ep in eps:
+                        html += f"<li>{ep}</li>"
+                    html += "</ul></section>"""
 
-        # 📂 AI Selected Templates
-        try:
-            for t in self.sections:
-                if t[1] and t[1].endswith("selected_templates.json"):
-                    templates = json.loads(t[2])
-                    if templates:
+        # 🔑 JavaScript Secrets
+        for t in self.sections:
+            if t[1] and t[1].endswith("js_secrets.json"):
+                try:
+                    secrets = json.loads(t[2])
+                    if secrets:
                         html += """
-<section class="mb-4">
-<h2>📂 AI Selected Templates</h2>
-<ul>
-"""
-                        for tpl in templates:
-                            html += f"<li>{tpl}</li>"
+    <section class="mb-4">
+    <h2>🔑 JavaScript Secrets</h2><ul>
+    """
+                        for item in secrets:
+                            url = item.get("url")
+                            matches = ", ".join(item.get("matches", []))
+                            html += f"<li>{url} → {matches}</li>"
                         html += "</ul></section>"
-        except Exception:
-            pass
+                except Exception:
+                    pass
 
-        # 🧪 JWT AI Results
-        try:
-            for t in self.sections:
-                if t[1] and t[1].endswith("jwt_ai_results.json"):
+        # 📦 BackupFinder
+        for t in self.sections:
+            if t[1] and t[1].endswith("backup_urls.json"):
+                try:
+                    leaks = json.loads(t[2])
+                    if leaks:
+                        html += """
+    <section class="mb-4">
+    <h2>📦 Backup / Leak Files (Wayback)</h2>
+    <table class="table table-bordered">
+    <thead><tr><th>URL</th><th>Extension</th><th>Snapshot</th></tr></thead><tbody>
+    """
+                        for b in leaks:
+                            snap = b.get("snapshot", "")
+                            snap_html = f"<a href='{snap}' target='_blank'>View</a>" if snap else "—"
+                            html += f"<tr><td>{b.get('url')}</td><td>{b.get('extension')}</td><td>{snap_html}</td></tr>"
+                        html += "</tbody></table></section>"
+                except Exception:
+                    pass
+
+        # 🧪 JWT Findings (raw scan)
+        for t in self.sections:
+            if t[1] and t[1].endswith("jwt_results.json"):
+                try:
                     jwt_data = json.loads(t[2])
                     if jwt_data:
                         html += """
-<section class="mb-4">
-<h2>🧪 JWT Findings (AI)</h2>
-<ul>
-"""
+    <section class="mb-4">
+    <h2>🧪 JWT Findings</h2><ul>
+    """
                         for url, details in jwt_data.items():
+                            html += f"<li>{url} → {details.get('decoded','')}</li>"
+                        html += "</ul></section>"
+                except Exception:
+                    pass
+
+        # 🧪 JWT AI Analysis
+        for t in self.sections:
+            if t[1] and t[1].endswith("jwt_ai_results.json"):
+                try:
+                    jwt_ai = json.loads(t[2])
+                    if jwt_ai:
+                        html += """
+    <section class="mb-4">
+    <h2>🤖 JWT AI Analysis</h2><ul>
+    """
+                        for url, details in jwt_ai.items():
                             risky = details.get("risky", [])
                             if risky:
                                 html += f"<li><strong>{url}</strong>: {json.dumps(risky)}</li>"
                         html += "</ul></section>"
-        except Exception:
-            pass
+                except Exception:
+                    pass
 
-        # 📦 Backup / Leak Files
-        try:
-            if os.path.exists("backup_urls.json"):
-                with open("backup_urls.json") as f:
-                    backup_data = json.load(f)
-                if backup_data:
-                    html += """
-<section class="mb-4">
-<h2>📦 Backup / Leak Files (Wayback)</h2>
-<table class="table table-bordered">
-<thead><tr><th>URL</th><th>Extension</th><th>Snapshot</th></tr></thead><tbody>
-"""
-                    for b in backup_data:
-                        url = b.get("url", "")
-                        ext = b.get("extension", "")
-                        snap = b.get("snapshot", "") or ""
-                        snap_html = f"<a href='{snap}' target='_blank'>View</a>" if snap else "—"
-                        html += f"<tr><td>{url}</td><td>{ext}</td><td>{snap_html}</td></tr>"
-                    html += "</tbody></table></section>"
-        except Exception:
-            pass
+        # 🛠 Detected Technologies
+        for t in self.sections:
+            if t[1] and t[1].endswith("tech_ai.json"):
+                try:
+                    techs = json.loads(t[2]).get("technologies", [])
+                    if techs:
+                        html += """
+    <section class="mb-4">
+    <h2>🛠 Detected Technologies (AI)</h2><ul>
+    """
+                        for tech in techs:
+                            html += f"<li>{tech}</li>"
+                        html += "</ul></section>"
+                except Exception:
+                    pass
 
+        # 📂 AI Selected Templates
+        for t in self.sections:
+            if t[1] and t[1].endswith("selected_templates.json"):
+                try:
+                    templates = json.loads(t[2])
+                    if templates:
+                        html += """
+    <section class="mb-4">
+    <h2>📂 AI Selected Templates</h2><ul>
+    """
+                        for tpl in templates:
+                            html += f"<li>{tpl}</li>"
+                        html += "</ul></section>"
+                except Exception:
+                    pass
+
+        # 🧨 Nuclei Findings
         if grouped:
             html += """
-<section class="mb-4">
-<h2>Findings Overview (Nuclei - Deduplicated)</h2>
-<ul>
-"""
+    <section class="mb-4">
+    <h2>🧨 Nuclei Findings (Deduplicated)</h2><ul>
+    """
             for (template, name, sev), urls in grouped.items():
                 badge_class = severity_map.get(sev, "badge-info")
                 html += f"""
-<li>
-  <span class="badge {badge_class}">{sev.upper()}</span>
-  <strong>{name}</strong> ({template})<br>
-  Found in {len(urls)} URLs:
-  <ul>
-    {''.join(f"<li>{u}</li>" for u in urls)}
-  </ul>
-</li>
-"""
+    <li>
+    <span class="badge {badge_class}">{sev.upper()}</span>
+    <strong>{name}</strong> ({template})<br>
+    Found in {len(urls)} URLs:
+    <ul>{''.join(f"<li>{u}</li>" for u in urls)}</ul>
+    </li>
+    """
             html += "</ul></section>"
 
+        # Footer
         html += """
-</div>
-<footer class="text-center p-3 text-muted">
-Generated by ScannerPipeline
-</footer>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-</body></html>
-"""
+    </div>
+    <footer class="text-center p-3 text-muted">
+    Generated by ScannerPipeline
+    </footer>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    </body></html>
+    """
 
         file = f"report-{self.domain}.html"
         with open(file, "w") as f:
             f.write(html)
         return file
-
 
 # ---------------------------
 # Pipeline
@@ -1692,3 +1804,4 @@ if __name__ == "__main__":
     parser.add_argument("--domain", required=True)
     args = parser.parse_args()
     ScannerPipeline(args.domain, [ConsoleObserver(), LogFileObserver()]).run()
+
