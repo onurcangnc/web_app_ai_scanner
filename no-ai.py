@@ -10,6 +10,7 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 import jwt
 
+DEBUG_MODE = False
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -52,7 +53,7 @@ signal.signal(signal.SIGTERM, handle_exit)
 class Logger:
     @staticmethod
     def _print(color, msg):
-        with PRINT_LOCK: print(color + msg + Style.RESET_ALL)
+        with PRINT_LOCK: print(color + msg + Style.RESET_ALL, flush=True)
     @staticmethod
     def info(msg): Logger._print(Fore.CYAN, msg)
     @staticmethod
@@ -64,11 +65,13 @@ class Logger:
     @staticmethod
     def stage(title):
         with PRINT_LOCK:
-            print("\n" + "="*80)
-            print(Fore.MAGENTA + f"[ {title} ]" + Style.RESET_ALL)
-            print("="*80 + "\n")
+            print("\n" + "═"*70)
+            print(Fore.MAGENTA + f"   {title}" + Style.RESET_ALL)
+            print("═"*70 + "\n")
     @staticmethod
-    def debug(msg): Logger._print(Fore.LIGHTBLACK_EX, f"[DEBUG] {msg}")
+    def debug(msg):
+        if DEBUG_MODE:
+            Logger._print(Fore.LIGHTBLACK_EX, f"[DEBUG] {msg}")
 
 # ---------------------------
 # Stage Buffer / Barrier
@@ -135,71 +138,59 @@ def record_stage_output(stage, domain, filename):
     stage_barriers[stage].wait()
 
 
+# ---------------------------
+# Stage Output Printer
+# ---------------------------
 def print_stage_results(stage: str):
     SILENT_STAGES = {
         "Wayback - Historical URL Collection (No Live Check)",
         "Katana - Content Discovery via Crawling",
         "JS Hunter - .js URLs & secrets"
     }
-
     domains_contents = stage_outputs.get(stage, {})
-    if not domains_contents:
-        return
+    if not domains_contents: return
+    if stage in SILENT_STAGES: return  # tamamen sessiz bırak
 
-    # Header sadece FFUF için
-    if stage.startswith("FFUF"):
-        Logger.stage(stage)
+    Logger.stage(stage)
 
     for domain, content in domains_contents.items():
-        if stage in SILENT_STAGES:
-            continue
+        if not content.strip(): 
+            continue  # boş sonuçları yazma
 
-        # 🔴 Secret Scan özelleştirilmiş çıktı
+        print(Fore.YELLOW + f"[{domain}]" + Style.RESET_ALL)
+
+        # Secret Scan
         if stage.startswith("Secret Scan"):
-            print(Fore.YELLOW + f"[{domain}]" + Style.RESET_ALL)
             try:
                 findings = json.loads(content)
                 for f in findings:
-                    t = f.get("type")
-                    u = f.get("url")
-                    m = f.get("match", "")
-                    print(Fore.RED + f"[!] {t} in {u} → {m[:60]}..." + Style.RESET_ALL)
-            except Exception:
-                print(content)
-            print("\n" + "-"*40 + "\n")
-            continue
+                    t = f.get("type"); u = f.get("url"); m = f.get("match", "")
+                    print(Fore.RED + f"  • {t} in {u} → {m[:60]}..." + Style.RESET_ALL)
+            except: print(content)
 
-        # 🟢 JWT Scan özelleştirilmiş çıktı
-        if stage.startswith("JWT Scan"):
-            print(Fore.YELLOW + f"[{domain}]" + Style.RESET_ALL)
+        # JWT Scan
+        elif stage.startswith("JWT Scan"):
             try:
                 results = json.loads(content)
                 for url, data in results.items():
                     juicy = data.get("juicy", {})
                     if juicy:
-                        print(Fore.GREEN + f"[+] JWT in {url} → {juicy}" + Style.RESET_ALL)
+                        print(Fore.GREEN + f"  • JWT in {url} → {juicy}" + Style.RESET_ALL)
                     else:
-                        print(Fore.CYAN + f"[i] JWT in {url} (no juicy fields)" + Style.RESET_ALL)
-            except Exception:
-                print(content)
-            print("\n" + "-"*40 + "\n")
-            continue
+                        print(Fore.CYAN + f"  • JWT in {url} (no juicy fields)" + Style.RESET_ALL)
+            except: print(content)
 
-        # FFUF: endpoints yeşil
-        if stage.startswith("FFUF"):
-            print(Fore.YELLOW + f"[{domain}]" + Style.RESET_ALL)
-            if content and isinstance(content, str) and content.strip():
-                for line in content.splitlines():
-                    if line.strip():
-                        print(Fore.GREEN + line.strip() + Style.RESET_ALL)
-            print("\n" + "-"*40 + "\n")
-            continue
+        # FFUF
+        elif stage.startswith("FFUF"):
+            for line in content.splitlines():
+                if line.strip():
+                    print(Fore.GREEN + f"  • {line.strip()}" + Style.RESET_ALL)
 
-        # Diğer stage’ler default
-        print(Fore.YELLOW + f"[{domain}]" + Style.RESET_ALL)
-        if isinstance(content, str) and content.strip():
+        # Default
+        else:
             print(content)
-        print("\n" + "-"*40 + "\n")
+
+        print("-"*40 + "\n")
 
 # ---------------------------
 # Command Base
@@ -596,30 +587,44 @@ class BackupFinderCommand(Command):
 class JwtScanCommand(Command):
     def get_stage_name(self): return "JWT Scan - Heuristic token search"
     def execute(self):
-        out=f"jwt_{self.base}.json"
-        wayback_file=f"wayback_{self.base}.txt"
-        tokens,results={},{}
-        JWT_REGEX=re.compile(r'eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}')
-        JUICY_FIELDS=["email","username","password","api_key","access_token","session_id","role","scope"]
-        urls=[l.strip() for l in open(wayback_file)] if os.path.exists(wayback_file) else []
+        out = f"jwt_{self.base}.json"
+        wayback_file = f"wayback_{self.base}.txt"
+        tokens = {}
+        results = {}
+        JWT_REGEX = re.compile(r'eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}')
+        JUICY_FIELDS = ["email", "username", "password", "api_key", "access_token", "session_id", "role", "scope"]
+
+        urls = [l.strip() for l in open(wayback_file)] if os.path.exists(wayback_file) else []
         for url in urls:
-            decoded_url=requests.utils.unquote(url)
-            match=JWT_REGEX.search(decoded_url)
+            decoded_url = requests.utils.unquote(url)
+            match = JWT_REGEX.search(decoded_url)
             if match:
-                token=match.group(0)
-                tokens[url]=token
-                Logger.warning(f"[+] JWT candidate in URL: {url}")
-        for url,token in tokens.items():
+                token = match.group(0)
+                tokens[url] = token
+                # don't print here — we'll surface in print_stage_results
+        for url, token in tokens.items():
             try:
-                decoded=jwt.decode(token,options={"verify_signature":False})
-                juicy={k:v for k,v in decoded.items() if k in JUICY_FIELDS}
-                results[url]={"jwt":token,"decoded":decoded,"juicy":juicy}
-                if juicy: Logger.success(f"[+] Juicy fields in {url}: {juicy}")
+                decoded = jwt.decode(token, options={"verify_signature": False})
+                juicy = {k: v for k, v in decoded.items() if k in JUICY_FIELDS}
+                results[url] = {"jwt": token, "decoded": decoded, "juicy": juicy}
             except Exception as e:
+                # still include token even if decoding fails
+                results[url] = {"jwt": token, "decoded": None, "juicy": {}}
+                # keep debug log optional
                 Logger.debug(f"Failed to decode JWT from {url}: {e}")
-        with open(out,"w") as f: json.dump(results,f,indent=2)
-        if not results: Logger.info("[!] No JWT tokens found.")
-        return out
+
+        # write file
+        try:
+            with open(out, "w") as f:
+                json.dump(results, f, indent=2)
+        except Exception:
+            pass
+
+        # Prepare printable content (JSON string) to store immediately in stage_outputs
+        content_str = json.dumps(results, indent=2) if results else json.dumps({}, indent=2)
+
+        # Return tuple (filename, inline_content) so record_stage_output stores it immediately
+        return out, content_str
 
 # ---------------------------
 # Command Handler
