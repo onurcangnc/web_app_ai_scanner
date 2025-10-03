@@ -684,7 +684,9 @@ if __name__=="__main__":
     for i in range(n):
         t=threading.Thread(target=worker_loop,args=(q,i+1,stop),daemon=True); t.start(); threads.append(t)
     for stage in STAGE_ORDER:
+        # Tüm worker’ların aynı stage’i bitirmesini bekle
         stage_barriers[stage].wait()
+        # Sonuçları düzenli formatla ekrana bas
         print_stage_results(stage)
     q.join(); stop.set(); [t.join(1) for t in threads]
     Logger.success("[+] All done.")
