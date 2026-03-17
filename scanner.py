@@ -13,7 +13,7 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 import requests
 from rich.console import Console
-import re, jwt
+import re, jwt, asyncio
 
 
 
@@ -318,12 +318,15 @@ class FfufCommand(Command):
         baseline_json = "/tmp/baseline.json"
         baseline_wordlist = "/usr/share/wordlists/onelistforallmicro.txt"
 
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
         # --- Baseline scan (fw / fs detection) ---
         subprocess.run(
-            f"ffuf -u https://{self.domain}/FUZZ "
-            f"-w {baseline_wordlist} "
-            f"-mc all -of json -o {baseline_json} "
-            f"-maxtime-job 5",
+            f'ffuf -u https://{self.domain}/FUZZ '
+            f'-w {baseline_wordlist} '
+            f'-mc all -of json -o {baseline_json} '
+            f'-r -rate 50 -timeout 10 -maxtime-job 15 '
+            f'-H "User-Agent: {ua}"',
             shell=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
@@ -364,10 +367,12 @@ class FfufCommand(Command):
 
         # --- Main Scan ---
         subprocess.run(
-            f"ffuf -u https://{self.domain}/FUZZ "
-            f"-w {baseline_wordlist} "
-            f"-mc 200,201,202,203,204 {param_str} "
-            f"-of json -o ffuf.json",
+            f'ffuf -u https://{self.domain}/FUZZ '
+            f'-w {baseline_wordlist} '
+            f'-mc 200,201,202,203,204 {param_str} '
+            f'-r -rate 50 -timeout 10 '
+            f'-H "User-Agent: {ua}" '
+            f'-of json -o ffuf.json',
             shell=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
@@ -411,9 +416,14 @@ class FfufRootCommand(Command):
         out_json = "ffuf.json"
         out_txt = "ffuf.txt"
 
-        # Baseline quick run to estimate filters (maxtime-job small)
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+        # Baseline quick run to estimate filters
         subprocess.run(
-            f"ffuf -u https://{root}/FUZZ -w {baseline_wordlist} -mc all -of json -o {baseline_json} -maxtime-job 5",
+            f'ffuf -u https://{root}/FUZZ -w {baseline_wordlist} '
+            f'-mc all -of json -o {baseline_json} '
+            f'-r -rate 50 -timeout 10 -maxtime-job 15 '
+            f'-H "User-Agent: {ua}"',
             shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
@@ -451,7 +461,11 @@ class FfufRootCommand(Command):
 
         # Main ffuf on root
         subprocess.run(
-            f"ffuf -u https://{root}/FUZZ -w {baseline_wordlist} -mc 200,201,202,203,204 {param_str} -of json -o {out_json}",
+            f'ffuf -u https://{root}/FUZZ -w {baseline_wordlist} '
+            f'-mc 200,201,202,203,204 {param_str} '
+            f'-r -rate 50 -timeout 10 '
+            f'-H "User-Agent: {ua}" '
+            f'-of json -o {out_json}',
             shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
@@ -475,7 +489,174 @@ class FfufRootCommand(Command):
         self.result_file = out_txt
         return out_txt, "\n".join(endpoints)
 
-    
+
+# ---------------------------
+# ParallelFfufCommand - fuzz all alive subdomains in parallel
+# ---------------------------
+class ParallelFfufCommand(Command):
+    def get_stage_name(self) -> str:
+        return "FFUF (Parallel) - Multi-Subdomain Endpoint Discovery"
+
+    @staticmethod
+    def _get_alive_hosts() -> list[str]:
+        """alive.json'dan status_code 200 dönen host'ları çek."""
+        hosts = []
+        if not os.path.exists("alive.json"):
+            return hosts
+        with open("alive.json") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    if d.get("status_code") == 200:
+                        url = d.get("url", "")
+                        parsed = urlparse(url)
+                        host = parsed.netloc or parsed.path
+                        if host:
+                            hosts.append(host)
+                except Exception:
+                    continue
+        return list(dict.fromkeys(hosts))  # dedupe, preserve order
+
+    async def _fuzz_single(self, target, sem, baseline_wordlist):
+        """Tek bir target için baseline + main FFUF çalıştır."""
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        safe_name = target.replace(".", "_").replace(":", "_")
+        baseline_json = f"/tmp/baseline_{safe_name}.json"
+        out_json = f"ffuf_{safe_name}.json"
+        out_txt = f"ffuf_{safe_name}.txt"
+
+        async with sem:
+            Logger.info(f"[*] FFUF starting for {target}")
+
+            # --- Baseline scan ---
+            proc = await asyncio.create_subprocess_exec(
+                "ffuf",
+                "-u", f"https://{target}/FUZZ",
+                "-w", baseline_wordlist,
+                "-mc", "all",
+                "-of", "json", "-o", baseline_json,
+                "-r", "-rate", "50", "-timeout", "10", "-maxtime-job", "15",
+                "-H", f"User-Agent: {ua}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.wait()
+
+            # --- Baseline filtering ---
+            fw_vals, fs_vals = [], []
+            try:
+                with open(baseline_json) as f:
+                    data = json.load(f)
+                    for r in data.get("results", []):
+                        if "words" in r:
+                            fw_vals.append(r["words"])
+                        if "length" in r:
+                            fs_vals.append(r["length"])
+            except Exception:
+                pass
+
+            fw_base, fw_count = (0, 0)
+            fs_base, fs_count = (0, 0)
+            if fw_vals:
+                fw_base, fw_count = Counter(fw_vals).most_common(1)[0]
+            if fs_vals:
+                fs_base, fs_count = Counter(fs_vals).most_common(1)[0]
+
+            filter_args = []
+            if (fw_vals and fs_vals
+                    and fw_count >= len(fw_vals) * 0.6
+                    and fs_count >= len(fs_vals) * 0.6):
+                filter_args = ["-fw", str(fw_base), "-fs", str(fs_base)]
+            elif fw_count >= fs_count and fw_count > 0:
+                filter_args = ["-fw", str(fw_base)]
+            elif fs_count > 0:
+                filter_args = ["-fs", str(fs_base)]
+
+            Logger.warning(
+                f"[*] FFUF({target}) baseline → fw={fw_base}, fs={fs_base}, "
+                f"filter={filter_args}"
+            )
+
+            # --- Main scan ---
+            main_args = [
+                "ffuf",
+                "-u", f"https://{target}/FUZZ",
+                "-w", baseline_wordlist,
+                "-mc", "200,201,202,203,204",
+                *filter_args,
+                "-r", "-rate", "50", "-timeout", "10",
+                "-H", f"User-Agent: {ua}",
+                "-of", "json", "-o", out_json,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *main_args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.wait()
+
+            # --- Extract endpoints ---
+            endpoints = []
+            try:
+                with open(out_json) as f:
+                    data = json.load(f)
+                    for r in data.get("results", []):
+                        url = r.get("url")
+                        if url:
+                            endpoints.append(url)
+            except Exception:
+                pass
+
+            with open(out_txt, "w") as f:
+                f.write("\n".join(endpoints))
+
+            Logger.success(f"[+] FFUF({target}) → {len(endpoints)} endpoints")
+            return endpoints
+
+    def execute(self):
+        hosts = self._get_alive_hosts()
+        if not hosts:
+            Logger.warning("[!] No alive hosts with status 200, skipping parallel FFUF")
+            with open("ffuf.txt", "w") as f:
+                f.write("")
+            self.result_file = "ffuf.txt"
+            return "ffuf.txt", ""
+
+        Logger.info(f"[*] Parallel FFUF targets ({len(hosts)}): {', '.join(hosts[:10])}")
+        baseline_wordlist = "/usr/share/wordlists/onelistforallmicro.txt"
+
+        async def _run_all():
+            sem = asyncio.Semaphore(3)
+            tasks = [self._fuzz_single(h, sem, baseline_wordlist) for h in hosts]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        results = asyncio.run(_run_all())
+
+        # Birleştir → ffuf.txt
+        all_endpoints = []
+        for r in results:
+            if isinstance(r, list):
+                all_endpoints.extend(r)
+            elif isinstance(r, Exception):
+                Logger.warning(f"[!] FFUF task failed: {r}")
+
+        all_endpoints = list(dict.fromkeys(all_endpoints))  # dedupe
+        with open("ffuf.txt", "w") as f:
+            f.write("\n".join(all_endpoints))
+
+        Logger.success(f"[+] Parallel FFUF total → {len(all_endpoints)} unique endpoints")
+        Logger.list("[+] FFUF Endpoints (sample)", all_endpoints[:30], color=Fore.MAGENTA)
+        if len(all_endpoints) > 30:
+            Logger.warning(f"... and {len(all_endpoints)-30} more (truncated)")
+
+        self.result_file = "ffuf.txt"
+        return "ffuf.txt", "\n".join(all_endpoints)
+
+
 class KatanaCommand(Command):
 
     def get_stage_name(self) -> str:
@@ -1312,8 +1493,27 @@ class DomainStrategy(ABC):
 
 class RootDomainStrategy(DomainStrategy):
     def get_targets(self, domain: str) -> list[str]:
-        # Subfinder çalışsın ama sadece root geri dönsün
-        return [domain]
+        """alive.json'dan status_code 200 dönen host'ları döndür."""
+        hosts = []
+        if os.path.exists("alive.json"):
+            with open("alive.json") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if d.get("status_code") == 200:
+                            url = d.get("url", "")
+                            parsed = urlparse(url)
+                            host = parsed.netloc or parsed.path
+                            if host:
+                                hosts.append(host)
+                    except Exception:
+                        continue
+        # Dedupe, preserve order
+        hosts = list(dict.fromkeys(hosts))
+        return hosts if hosts else [domain]
 
 class SubdomainStrategy(DomainStrategy):
     def get_targets(self, domain: str) -> list[str]:
@@ -1343,6 +1543,7 @@ class CommandFactory:
         "backup": BackupFinderCommand,
         "jwt_scan": JwtScanCommand,
         "jwt_ai": AiAnalyzeJwtCommand,
+        "ffuf_parallel": ParallelFfufCommand,
     }
 
     @staticmethod
@@ -1430,12 +1631,12 @@ def build_chain(domain: str, is_root: bool = False):
     Eğer is_root True ise sadece pasif / enum aşamaları.
     Aksi halde full pipeline çalışır.
     """
-    # Root → Only passive phases
+    # Root → Subfinder + HTTPX first, then ParallelFfuf on alive hosts
     if is_root:
         return CommandHandler(TimingDecorator(SubfinderCommand(domain)),
             CommandHandler(TimingDecorator(HttpxCommand(domain)),
             CommandHandler(TimingDecorator(SubzyCommand(domain)),
-            CommandHandler(TimingDecorator(FfufRootCommand(domain)),
+            CommandHandler(TimingDecorator(ParallelFfufCommand(domain)),
             CommandHandler(TimingDecorator(AiSelectEndpointsCommand(domain)),
             CommandHandler(TimingDecorator(KatanaCommand(domain)),
             CommandHandler(TimingDecorator(WaybackCommand(domain)),
